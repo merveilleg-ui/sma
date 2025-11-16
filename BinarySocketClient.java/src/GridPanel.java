@@ -8,136 +8,126 @@ import java.util.List;
 
 public class GridPanel extends JPanel {
 
-    // Taille de chaque "pixel" en pixels réels à l'écran
     private final int PIXEL_SIZE = 10;
+    private static final int ANIMATION_DELAY = 16; // ~60 FPS
 
-    // Intervalle de l'animation (en ms). 16ms = ~60 FPS
-    private static final int ANIMATION_DELAY = 16;
-
-    // La grille statique (murs, feu, etc.) SANS les individus
+    // Grille statique (Murs, Sol, Sorties, Objets)
     private char[][] staticGrille;
 
-    // La liste des individus (dynamiques) que nous animons
+    // Listes pour les objets animés
     private final List<Individual> individuals;
+    private final List<FireParticle> fireParticles; // NOUVELLE LISTE
 
     private final int largeurGrille;
     private final int hauteurGrille;
-
-    // Le "moteur" d'animation qui se déclenche à intervalle régulier
     private final Timer animationTimer;
 
     public GridPanel(int largeur, int hauteur) {
         this.largeurGrille = largeur;
         this.hauteurGrille = hauteur;
 
-        // Initialise une grille statique vide
         this.staticGrille = new char[hauteur][largeur];
-
-        // Initialise la liste (thread-safe) des individus
         this.individuals = new ArrayList<>();
+        this.fireParticles = new ArrayList<>(); // Initialisation
 
         setPreferredSize(new Dimension(largeur * PIXEL_SIZE, hauteur * PIXEL_SIZE));
 
-        // --- NOUVEAU : Démarrage du Timer d'animation ---
-        this.animationTimer = new Timer(ANIMATION_DELAY, new ActionListener() {
-            @Override
-            public void actionPerformed(ActionEvent e) {
-                // À chaque "tick" du timer...
-                updateIndividuals(); // 1. Mettre à jour la position animée
-                repaint();         // 2. Redemander un dessin
-            }
+        // Le Timer met à jour les Individus ET le Feu
+        this.animationTimer = new Timer(ANIMATION_DELAY, e -> {
+            updateIndividuals();
+            updateFireParticles(); // NOUVEL APPEL
+            repaint();
         });
         this.animationTimer.start();
     }
 
     /**
-     * Met à jour la grille de données. C'est ici que la "magie" opère.
-     * Cette méthode sépare la grille statique des individus.
-     * * @param nouvelleGrille La grille 2D complète reçue du serveur.
+     * Met à jour l'état de la grille en fonction des données du serveur.
+     * Sépare les éléments statiques, les individus et le feu.
      */
     public synchronized void setGrille(char[][] nouvelleGrille) {
-        // 1. Listes temporaires pour le matching
-        List<Point> newPositions = new ArrayList<>();
-        char[][] newStaticGrille = new char[hauteurGrille][largeurGrille];
 
-        // 2. Séparer les 'I' du reste
+        List<Point> newIndividualPositions = new ArrayList<>();
+        // NOUVEAU : Grille temporaire pour marquer les 'F' vus
+        boolean[][] fireSeenOnServer = new boolean[hauteurGrille][largeurGrille];
+
+        // 1. Initialiser la grille statique et trouver les individus/feu
         for (int y = 0; y < hauteurGrille; y++) {
             for (int x = 0; x < largeurGrille; x++) {
+
                 char c = nouvelleGrille[y][x];
+
                 if (c == 'I') {
-                    newPositions.add(new Point(x, y));
-                    newStaticGrille[y][x] = '.'; // Met un sol sous l'individu
+                    newIndividualPositions.add(new Point(x, y));
+                    this.staticGrille[y][x] = '.'; // Sol sous l'individu
+
+                } else if (c == 'F') {
+                    fireSeenOnServer[y][x] = true; // Marque le feu
+                    this.staticGrille[y][x] = '.'; // Sol sous le feu
+
                 } else {
-                    newStaticGrille[y][x] = c;
+                    this.staticGrille[y][x] = c; // Mur, Sol, Objet, Sortie
                 }
             }
         }
 
-        // 3. Mettre à jour la grille statique
-        this.staticGrille = newStaticGrille;
+        // 2. Réconcilier les individus (inchangé)
+        reconcileIndividuals(newIndividualPositions);
 
-        // 4. "Réconcilier" la liste des individus avec les nouvelles positions
-        reconcileIndividuals(newPositions);
+        // 3. NOUVEAU : Réconcilier les particules de feu
+        reconcileFire(fireSeenOnServer);
     }
 
     /**
-     * Compare la liste actuelle des individus avec les nouvelles positions
-     * pour "matcher" les mouvements, créer les nouveaux et supprimer les anciens.
+     * Met à jour la liste des particules de feu en fonction de ce que le serveur a envoyé.
      */
-    private synchronized void reconcileIndividuals(List<Point> newPositions) {
+    private synchronized void reconcileFire(boolean[][] fireSeenOnServer) {
+        // 1. Marquer les particules existantes comme "non vues"
+        for (FireParticle p : fireParticles) {
+            p.setSeen(false);
+        }
 
-        List<Individual> unassigned = new ArrayList<>(this.individuals);
-        List<Point> toCreate = new ArrayList<>();
-
-        // 1. Tenter de "matcher" les nouvelles positions aux individus existants
-        for (Point pos : newPositions) {
-            Individual closest = findClosestUnassigned(pos, unassigned);
-
-            if (closest != null) {
-                // Trouvé ! C'est (probablement) un mouvement.
-                closest.setTarget(pos.x, pos.y); // Donne la nouvelle cible
-                unassigned.remove(closest);        // Marque comme "assigné"
-            } else {
-                // Pas de correspondance proche = un nouvel individu
-                toCreate.add(pos);
+        // 2. Parcourir la grille du serveur
+        for (int y = 0; y < hauteurGrille; y++) {
+            for (int x = 0; x < largeurGrille; x++) {
+                if (fireSeenOnServer[y][x]) {
+                    // Le serveur veut du feu ici
+                    FireParticle existing = findFireAt(x, y);
+                    if (existing != null) {
+                        // Le feu existe déjà, on le marque comme "vu"
+                        existing.setSeen(true);
+                    } else {
+                        // C'est un NOUVEAU feu, on crée la particule
+                        fireParticles.add(new FireParticle(x, y));
+                    }
+                }
             }
         }
 
-        // 2. Les individus "unassigned" restants n'ont pas de nouvelle position
-        // -> Ils ont disparu.
-        this.individuals.removeAll(unassigned);
-
-        // 3. Les positions "toCreate" restantes sont de nouveaux individus
-        for (Point pos : toCreate) {
-            this.individuals.add(new Individual(pos.x, pos.y));
-        }
-    }
-
-    /**
-     * Trouve l'individu (non assigné) le plus proche d'une position.
-     * Limité à une petite distance pour éviter les "téléportations" illogiques.
-     */
-    private Individual findClosestUnassigned(Point pos, List<Individual> unassigned) {
-        // Seuil de distance (en cases). Un individu ne peut pas sauter de plus de 2 cases.
-        final double MAX_MOVE_DISTANCE = 2.0;
-
-        Individual closest = null;
-        double minDistance = Double.MAX_VALUE;
-
-        for (Individual ind : unassigned) {
-            // Distance euclidienne simple
-            double dist = Math.sqrt(Math.pow(ind.getTargetX() - pos.x, 2) + Math.pow(ind.getTargetY() - pos.y, 2));
-
-            if (dist < minDistance && dist <= MAX_MOVE_DISTANCE) {
-                minDistance = dist;
-                closest = ind;
+        // 3. Supprimer les particules de feu qui n'existent plus (non "vues")
+        // Utilisation d'un Iterator pour suppression sécurisée
+        Iterator<FireParticle> it = fireParticles.iterator();
+        while (it.hasNext()) {
+            if (!it.next().wasSeen()) {
+                it.remove(); // Le feu s'est éteint
             }
         }
-        return closest;
     }
 
     /**
-     * Appelé par le Timer, met à jour la position animée de tous les individus.
+     * Helper : Trouve une particule de feu à une coordonnée (ou null).
+     */
+    private FireParticle findFireAt(int x, int y) {
+        for (FireParticle p : fireParticles) {
+            if (p.getX() == x && p.getY() == y) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Appelé par le Timer : met à jour l'animation des individus.
      */
     private synchronized void updateIndividuals() {
         for (Individual ind : individuals) {
@@ -146,14 +136,22 @@ public class GridPanel extends JPanel {
     }
 
     /**
-     * Méthode Swing, appelée automatiquement
-     * chaque fois que le panneau a besoin d'être redessiné (ex: .repaint()).
+     * Appelé par le Timer : met à jour l'animation du feu.
+     */
+    private synchronized void updateFireParticles() {
+        for (FireParticle p : fireParticles) {
+            p.update(); // Fait progresser l'intensité (Orange -> Rouge)
+        }
+    }
+
+    /**
+     * Méthode de dessin (appelée par repaint()).
      */
     @Override
     protected synchronized void paintComponent(Graphics g) {
         super.paintComponent(g);
 
-        // --- 1. Dessiner la grille statique (Murs, Feu, Sol...) ---
+        // --- 1. Dessiner la grille statique (Murs, Sol, 'O', 'S') ---
         if (staticGrille != null) {
             for (int y = 0; y < hauteurGrille; y++) {
                 for (int x = 0; x < largeurGrille; x++) {
@@ -163,24 +161,62 @@ public class GridPanel extends JPanel {
             }
         }
 
-        // --- 2. Dessiner tous les individus par-dessus ---
+        // --- 2. Dessiner les particules de feu (par-dessus) ---
+        for (FireParticle p : fireParticles) {
+            p.draw(g, PIXEL_SIZE);
+        }
+
+        // --- 3. Dessiner les individus (par-dessus tout) ---
         for (Individual ind : individuals) {
             ind.draw(g, PIXEL_SIZE);
         }
     }
 
     /**
-     * Correspondance entre le caractère de la simulation et une couleur Java.
+     * Couleurs pour la grille STATIQUE uniquement.
      */
     private Color getCouleurPourChar(char c) {
         switch (c) {
             case 'M': return Color.BLACK;
-            case 'I': return Color.BLUE; // Ne devrait plus être appelé, mais au cas où
-            case 'F': return Color.RED;
             case 'S': return Color.GREEN;
             case 'O': return Color.GRAY;
             case '.': return Color.WHITE;
+            // 'F' et 'I' sont gérés par leurs listes respectives
             default: return Color.LIGHT_GRAY;
         }
+    }
+
+    // --- (Les méthodes reconcileIndividuals et findClosestUnassigned restent identiques) ---
+
+    private synchronized void reconcileIndividuals(List<Point> newPositions) {
+        List<Individual> unassigned = new ArrayList<>(this.individuals);
+        List<Point> toCreate = new ArrayList<>();
+        for (Point pos : newPositions) {
+            Individual closest = findClosestUnassigned(pos, unassigned);
+            if (closest != null) {
+                closest.setTarget(pos.x, pos.y);
+                unassigned.remove(closest);
+            } else {
+                toCreate.add(pos);
+            }
+        }
+        this.individuals.removeAll(unassigned);
+        for (Point pos : toCreate) {
+            this.individuals.add(new Individual(pos.x, pos.y));
+        }
+    }
+
+    private Individual findClosestUnassigned(Point pos, List<Individual> unassigned) {
+        final double MAX_MOVE_DISTANCE = 2.0;
+        Individual closest = null;
+        double minDistance = Double.MAX_VALUE;
+        for (Individual ind : unassigned) {
+            double dist = Math.sqrt(Math.pow(ind.getTargetX() - pos.x, 2) + Math.pow(ind.getTargetY() - pos.y, 2));
+            if (dist < minDistance && dist <= MAX_MOVE_DISTANCE) {
+                minDistance = dist;
+                closest = ind;
+            }
+        }
+        return closest;
     }
 }
